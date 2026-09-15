@@ -1,0 +1,8 @@
+data/
+downloads/
+*.db
+*.db-shm
+*.db-wal
+.env
+bin/
+*.exe
