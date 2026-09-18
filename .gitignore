@@ -3,6 +3,23 @@ downloads/
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 .env
+.env.*
 bin/
 *.exe
+
+# Go build and test artifacts
+*.test
+coverage.out
+coverage.html
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
