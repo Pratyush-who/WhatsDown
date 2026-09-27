@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Pratyush-who/WhatsDown/internal/whatsapp"
+	"github.com/chzyer/readline"
 	"github.com/spf13/cobra"
 )
 
@@ -569,7 +571,180 @@ func truncateStr(s string, maxLen int) string {
 	return s
 }
 
+func createInteractiveCompleter(_ *whatsapp.Client) *readline.PrefixCompleter {
+	return readline.NewPrefixCompleter(
+		readline.PcItem("help"),
+		readline.PcItem("send",
+			readline.PcItem("<recipient> \"<message>\""),
+		),
+		readline.PcItem("media",
+			readline.PcItem("<recipient> <file-path> [caption]"),
+		),
+		readline.PcItem("schedule",
+			readline.PcItem("<recipient> \"<message>\" --at \"<time>\""),
+			readline.PcItem("<recipient> \"<message>\" --in <duration>"),
+			readline.PcItem("<recipient> --file <path> --caption \"<text>\" --at \"<time>\""),
+			readline.PcItem("list"),
+			readline.PcItem("cancel"),
+		),
+		readline.PcItem("schedules"),
+		readline.PcItem("cancel",
+			readline.PcItem("<schedule-id>"),
+		),
+		readline.PcItem("inspect",
+			readline.PcItem("<contact> [count]"),
+		),
+		readline.PcItem("chats"),
+		readline.PcItem("status"),
+		readline.PcItem("setup"),
+		readline.PcItem("daemon"),
+		readline.PcItem("quit"),
+	)
+}
+
 func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          ">> ",
+		AutoComplete:    createInteractiveCompleter(client),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "quit",
+	})
+	if err != nil {
+		return runFallbackInteractiveShell(ctx, client)
+	}
+	defer rl.Close()
+
+	for {
+		line, err := rl.Readline()
+		if err != nil {
+			if errors.Is(err, readline.ErrInterrupt) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		line = strings.TrimSpace(line)
+		parts := tokenizeLine(line)
+		if len(parts) == 0 {
+			continue
+		}
+		command := strings.ToLower(parts[0])
+		switch command {
+		case "":
+			continue
+		case "help":
+			printHelp()
+		case "send":
+			if len(parts) < 3 {
+				fmt.Println("Usage: send <phone/contact> <message>")
+				break
+			}
+			recipient, text, err := splitRecipientMessage(ctx, client, parts[1:])
+			if err != nil {
+				fmt.Printf("Send failed: %v\n", err)
+				break
+			}
+			if err := client.SendText(ctx, recipient, text); err != nil {
+				fmt.Printf("Send failed: %v\n", err)
+				break
+			}
+			fmt.Println("Message sent.")
+		case "media":
+			if len(parts) < 3 {
+				fmt.Println("Usage: media <phone/contact> <file-path> [caption]")
+				break
+			}
+			recipient, filePath, caption, err := parseMediaArgs(ctx, client, parts[1:])
+			if err != nil {
+				fmt.Printf("Media failed: %v\n", err)
+				break
+			}
+			if err := client.SendMedia(ctx, recipient, filePath, caption); err != nil {
+				fmt.Printf("Media failed: %v\n", err)
+				break
+			}
+			fmt.Println("Media sent.")
+		case "schedule":
+			handleInteractiveSchedule(ctx, client, parts[1:])
+		case "schedules":
+			printScheduleList(client.Schedules().List(false))
+		case "cancel":
+			if len(parts) < 2 {
+				fmt.Println("Usage: cancel <schedule-id>")
+				break
+			}
+			if err := client.Schedules().Cancel(parts[1]); err != nil {
+				fmt.Printf("Cancel failed: %v\n", err)
+				break
+			}
+			fmt.Printf("Schedule %s cancelled.\n", parts[1])
+		case "status":
+			printStatus(client)
+		case "inspect":
+			if len(parts) < 2 {
+				fmt.Println("Usage: inspect <contact> [count]")
+				break
+			}
+			chat, count, err := parseInspectArgs(parts[1:])
+			if err != nil {
+				fmt.Printf("Inspect failed: %v\n", err)
+				break
+			}
+			target, err := client.FindContactTarget(ctx, chat)
+			if err != nil {
+				fmt.Printf("Inspect failed: %v\n", err)
+				break
+			}
+			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+			printRecentMessages(client, target, count)
+		case "chats":
+			seen := map[string]time.Time{}
+			for _, message := range client.Messages() {
+				chatKey := message.Chat.ToNonAD().String()
+				if message.At.After(seen[chatKey]) {
+					seen[chatKey] = message.At
+				}
+			}
+			type chatItem struct {
+				jid string
+				at  time.Time
+			}
+			chats := make([]chatItem, 0, len(seen))
+			for jid, at := range seen {
+				chats = append(chats, chatItem{jid, at})
+			}
+			sort.Slice(chats, func(i, j int) bool { return chats[i].at.After(chats[j].at) })
+			for i, ch := range chats {
+				if i == 10 {
+					break
+				}
+				target, _ := client.FindContactTarget(ctx, ch.jid)
+				name := ch.jid
+				if target != nil && target.DisplayName != "" {
+					name = fmt.Sprintf("%s (%s)", target.DisplayName, ch.jid)
+				}
+				fmt.Printf("%d. %s\t[%s]\n", i+1, name, ch.at.Format("2006-01-02 15:04"))
+			}
+		case "daemon":
+			fmt.Println("Note: The scheduler daemon is already active inside this interactive session.")
+			fmt.Println("To run it in the background when the terminal is closed, run 'pstw daemon' from your system shell.")
+		case "setup":
+			fmt.Println("This account is already connected. Type quit or press Ctrl+C to disconnect.")
+		case "quit":
+			return nil
+		default:
+			fmt.Printf("Unknown command %q. Type help to see available commands.\n", command)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+	}
+}
+
+func runFallbackInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 	input := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print(">> ")
@@ -968,11 +1143,14 @@ func completeContacts(toComplete string) []string {
 		}
 	}
 
-	// 2. From messages.json
+	// 2. From messages.json (ignore group chats)
 	if data, err := os.ReadFile(filepath.Join("data", "messages.json")); err == nil {
 		var messages []whatsapp.Message
 		if err := json.Unmarshal(data, &messages); err == nil {
 			for _, m := range messages {
+				if m.Chat.Server == "g.us" || strings.HasPrefix(m.Chat.User, "120363") {
+					continue
+				}
 				chatUser := m.Chat.User
 				if chatUser != "" && !seen[chatUser] {
 					seen[chatUser] = true
