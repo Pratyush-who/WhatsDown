@@ -24,7 +24,7 @@ func New() *cobra.Command {
 		Short: "Personal WhatsApp terminal client",
 		RunE:  runConnection,
 	}
-	root.AddCommand(setupCommand(), statusCommand(), sendCommand(), contactsCommand(), checkCommand(), chatsCommand(), messagesCommand(), replyCommand(), reactCommand(), searchCommand(), listenCommand())
+	root.AddCommand(setupCommand(), statusCommand(), sendCommand(), mediaCommand(), contactsCommand(), checkCommand(), chatsCommand(), messagesCommand(), inspectCommand(), replyCommand(), reactCommand(), searchCommand(), listenCommand())
 	return root
 }
 
@@ -73,7 +73,11 @@ func sendCommand() *cobra.Command {
 			}
 			return withClient(cmd, true, func(ctx context.Context, client *whatsapp.Client) error {
 				if filePath != "" {
-					if err := client.SendFile(ctx, args[0], filePath); err != nil {
+					caption := ""
+					if len(args) > 1 {
+						caption = strings.Join(args[1:], " ")
+					}
+					if err := client.SendMedia(ctx, args[0], filePath, caption); err != nil {
 						return err
 					}
 					fmt.Println("File sent.")
@@ -91,7 +95,34 @@ func sendCommand() *cobra.Command {
 			})
 		},
 	}
-	command.Flags().StringVar(&filePath, "file", "", "send a document from this path")
+	command.Flags().StringVar(&filePath, "file", "", "send a media/document from this path")
+	return command
+}
+
+func mediaCommand() *cobra.Command {
+	var caption string
+	command := &cobra.Command{
+		Use:   "media <recipient> <file-path> [caption]",
+		Short: "Send an image, video, audio, or document",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd, true, func(ctx context.Context, client *whatsapp.Client) error {
+				recipient, filePath, parsedCaption, err := parseMediaArgs(ctx, client, args)
+				if err != nil {
+					return err
+				}
+				if caption != "" {
+					parsedCaption = caption
+				}
+				if err := client.SendMedia(ctx, recipient, filePath, parsedCaption); err != nil {
+					return err
+				}
+				fmt.Println("Media sent.")
+				return nil
+			})
+		},
+	}
+	command.Flags().StringVarP(&caption, "caption", "c", "", "caption for the media file")
 	return command
 }
 
@@ -139,11 +170,12 @@ func checkCommand() *cobra.Command {
 
 func chatsCommand() *cobra.Command {
 	return &cobra.Command{Use: "chats", Short: "Show chats seen during this session", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		return withClient(cmd, false, func(_ context.Context, client *whatsapp.Client) error {
+		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
 			seen := map[string]time.Time{}
 			for _, message := range client.Messages() {
-				if message.At.After(seen[message.Chat.String()]) {
-					seen[message.Chat.String()] = message.At
+				chatKey := message.Chat.ToNonAD().String()
+				if message.At.After(seen[chatKey]) {
+					seen[chatKey] = message.At
 				}
 			}
 			type chat struct {
@@ -156,10 +188,15 @@ func chatsCommand() *cobra.Command {
 			}
 			sort.Slice(chats, func(i, j int) bool { return chats[i].at.After(chats[j].at) })
 			for i, chat := range chats {
-				if i == 5 {
+				if i == 10 {
 					break
 				}
-				fmt.Printf("%d. %s\t%s\n", i+1, chat.jid, chat.at.Format(time.RFC3339))
+				target, _ := client.FindContactTarget(ctx, chat.jid)
+				name := chat.jid
+				if target != nil && target.DisplayName != "" {
+					name = fmt.Sprintf("%s (%s)", target.DisplayName, chat.jid)
+				}
+				fmt.Printf("%d. %s\t[%s]\n", i+1, name, chat.at.Format("2006-01-02 15:04"))
 			}
 			return nil
 		})
@@ -169,23 +206,115 @@ func chatsCommand() *cobra.Command {
 func messagesCommand() *cobra.Command {
 	return &cobra.Command{Use: "messages <chat>", Short: "Show messages seen during this session", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
-			jid, err := client.ResolveRecipient(ctx, args[0])
+			target, err := client.FindContactTarget(ctx, args[0])
 			if err != nil {
 				return err
 			}
-			count := 0
-			for _, message := range client.Messages() {
-				if message.Chat == jid {
-					fmt.Printf("[%d] %s\t%s\n    %s\n", message.Index, message.At.Format("15:04"), message.Sender.String(), message.Text)
-					count++
-				}
+			messages := client.MessagesForTarget(target)
+			if len(messages) == 0 {
+				fmt.Println("No messages seen for this contact.")
+				return nil
 			}
-			if count == 0 {
-				fmt.Println("No messages seen in this session.")
+			for _, message := range messages {
+				direction := "<--"
+				sender := target.DisplayName
+				if message.FromMe {
+					direction = "-->"
+					sender = "YOU"
+				}
+				fmt.Printf("[%d] %s\t%s %s\n    %s\n", message.Index, message.At.Format("15:04"), sender, direction, message.Text)
 			}
 			return nil
 		})
 	}}
+}
+
+func inspectCommand() *cobra.Command {
+	return &cobra.Command{Use: "inspect <chat> [count]", Short: "Show the latest messages in a chat (combined sent & received)", Args: cobra.MinimumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		chat, count, err := parseInspectArgs(args)
+		if err != nil {
+			return err
+		}
+		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
+			target, err := client.FindContactTarget(ctx, chat)
+			if err != nil {
+				return err
+			}
+			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+			printRecentMessages(client, target, count)
+			return nil
+		})
+	}}
+}
+
+func max(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func parseInspectArgs(args []string) (string, int, error) {
+	if len(args) == 0 {
+		return "", 0, errors.New("usage: inspect <contact> [count]")
+	}
+	countArgs := []string(nil)
+	chatArgs := args
+	if len(args) >= 2 {
+		if _, err := strconv.Atoi(args[len(args)-1]); err == nil {
+			countArgs = args[len(args)-1:]
+			chatArgs = args[:len(args)-1]
+		}
+	}
+	if len(chatArgs) == 0 {
+		return "", 0, errors.New("contact is required")
+	}
+	count, err := messageCount(countArgs)
+	if err != nil {
+		return "", 0, err
+	}
+	chat := strings.Trim(strings.Join(chatArgs, " "), "\"'")
+	if chat == "" {
+		return "", 0, errors.New("contact is required")
+	}
+	return chat, count, nil
+}
+
+func messageCount(args []string) (int, error) {
+	if len(args) == 0 {
+		return 5, nil
+	}
+	count, err := strconv.Atoi(args[0])
+	if err != nil || count < 1 {
+		return 0, errors.New("count must be a positive integer")
+	}
+	return count, nil
+}
+
+func printRecentMessages(client *whatsapp.Client, target *whatsapp.ContactTarget, count int) {
+	messages := client.MessagesForTarget(target)
+	if len(messages) > count {
+		messages = messages[len(messages)-count:]
+	}
+	if len(messages) == 0 {
+		fmt.Println("No messages found in this chat.")
+		return
+	}
+	for _, message := range messages {
+		direction := "<--"
+		sender := target.DisplayName
+		if message.FromMe {
+			direction = "-->"
+			sender = "YOU"
+		} else if sender == "" {
+			if message.Sender.User != "" {
+				sender = message.Sender.User
+			} else {
+				sender = "Contact"
+			}
+		}
+		fmt.Printf("[%s] %s %s\n    %s\n", message.At.Format("2006-01-02 15:04"), sender, direction, message.Text)
+	}
 }
 
 func replyCommand() *cobra.Command {
@@ -264,6 +393,38 @@ func runConnection(cmd *cobra.Command, _ []string) error {
 	return runInteractiveShell(ctx, client)
 }
 
+func tokenizeLine(line string) []string {
+	var tokens []string
+	var current strings.Builder
+	inQuote := false
+	var quoteChar rune
+
+	for _, r := range line {
+		switch {
+		case inQuote:
+			if r == quoteChar {
+				inQuote = false
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '"' || r == '\'':
+			inQuote = true
+			quoteChar = r
+		case r == ' ' || r == '\t':
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+	return tokens
+}
+
 func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 	input := bufio.NewScanner(os.Stdin)
 	for {
@@ -276,7 +437,7 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 		}
 
 		line := strings.TrimSpace(input.Text())
-		parts := strings.Fields(line)
+		parts := tokenizeLine(line)
 		if len(parts) == 0 {
 			continue
 		}
@@ -288,7 +449,7 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 			printHelp()
 		case "send":
 			if len(parts) < 3 {
-				fmt.Println("Usage: send <phone> <message>")
+				fmt.Println("Usage: send <phone/contact> <message>")
 				break
 			}
 			recipient, text, err := splitRecipientMessage(ctx, client, parts[1:])
@@ -301,8 +462,146 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 				break
 			}
 			fmt.Println("Message sent.")
+		case "media":
+			if len(parts) < 3 {
+				fmt.Println("Usage: media <phone/contact> <file-path> [caption]")
+				break
+			}
+			recipient, filePath, caption, err := parseMediaArgs(ctx, client, parts[1:])
+			if err != nil {
+				fmt.Printf("Media failed: %v\n", err)
+				break
+			}
+			if err := client.SendMedia(ctx, recipient, filePath, caption); err != nil {
+				fmt.Printf("Media failed: %v\n", err)
+				break
+			}
+			fmt.Println("Media sent.")
 		case "status":
 			printStatus(client)
+		case "inspect":
+			if len(parts) < 2 {
+				fmt.Println("Usage: inspect <contact> [count]")
+				break
+			}
+			chat, count, err := parseInspectArgs(parts[1:])
+			if err != nil {
+				fmt.Printf("Inspect failed: %v\n", err)
+				break
+			}
+			target, err := client.FindContactTarget(ctx, chat)
+			if err != nil {
+				fmt.Printf("Inspect failed: %v\n", err)
+				break
+			}
+			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+			printRecentMessages(client, target, count)
+		case "contacts":
+			query := ""
+			if len(parts) >= 2 {
+				query = strings.Join(parts[1:], " ")
+			}
+			contacts, err := client.Contacts(ctx)
+			if err != nil {
+				fmt.Printf("Contacts failed: %v\n", err)
+				break
+			}
+			for jid, contact := range contacts {
+				name := contact.FullName
+				if name == "" {
+					name = contact.PushName
+				}
+				if query == "" || strings.Contains(strings.ToLower(name), strings.ToLower(query)) {
+					fmt.Printf("%s\t%s\n", name, jid.String())
+				}
+			}
+		case "chats":
+			seen := map[string]time.Time{}
+			for _, message := range client.Messages() {
+				chatKey := message.Chat.ToNonAD().String()
+				if message.At.After(seen[chatKey]) {
+					seen[chatKey] = message.At
+				}
+			}
+			type chatItem struct {
+				jid string
+				at  time.Time
+			}
+			chats := make([]chatItem, 0, len(seen))
+			for jid, at := range seen {
+				chats = append(chats, chatItem{jid, at})
+			}
+			sort.Slice(chats, func(i, j int) bool { return chats[i].at.After(chats[j].at) })
+			for i, ch := range chats {
+				if i == 10 {
+					break
+				}
+				target, _ := client.FindContactTarget(ctx, ch.jid)
+				name := ch.jid
+				if target != nil && target.DisplayName != "" {
+					name = fmt.Sprintf("%s (%s)", target.DisplayName, ch.jid)
+				}
+				fmt.Printf("%d. %s\t[%s]\n", i+1, name, ch.at.Format("2006-01-02 15:04"))
+			}
+		case "check":
+			if len(parts) < 2 {
+				fmt.Println("Usage: check <phone-number>")
+				break
+			}
+			jid, ok, err := client.CheckNumber(ctx, parts[1])
+			if err != nil {
+				fmt.Printf("Check failed: %v\n", err)
+				break
+			}
+			if ok {
+				fmt.Printf("WhatsApp: YES (%s)\n", jid.String())
+			} else {
+				fmt.Println("WhatsApp: NO")
+			}
+		case "reply":
+			if len(parts) < 3 {
+				fmt.Println("Usage: reply <chat> [message-number] <message>")
+				break
+			}
+			index := 0
+			textStart := 2
+			if len(parts) > 3 {
+				if parsed, err := strconv.Atoi(parts[2]); err == nil {
+					index = parsed
+					textStart = 3
+				}
+			}
+			if err := client.Reply(ctx, parts[1], strings.Join(parts[textStart:], " "), index); err != nil {
+				fmt.Printf("Reply failed: %v\n", err)
+				break
+			}
+			fmt.Println("Reply sent.")
+		case "react":
+			if len(parts) < 4 {
+				fmt.Println("Usage: react <chat> <message-number> <emoji>")
+				break
+			}
+			index, err := strconv.Atoi(parts[2])
+			if err != nil || index < 1 {
+				fmt.Println("message-number must be a positive integer")
+				break
+			}
+			if err := client.React(ctx, parts[1], index, parts[3]); err != nil {
+				fmt.Printf("React failed: %v\n", err)
+				break
+			}
+			fmt.Println("Reaction sent.")
+		case "search":
+			if len(parts) < 2 {
+				fmt.Println("Usage: search <text>")
+				break
+			}
+			query := strings.Join(parts[1:], " ")
+			for _, message := range client.Messages() {
+				if strings.Contains(strings.ToLower(message.Text), strings.ToLower(query)) {
+					fmt.Printf("[%d] %s: %s\n", message.Index, message.Chat.String(), message.Text)
+				}
+			}
 		case "setup":
 			fmt.Println("This account is already connected. Use Ctrl+C to disconnect.")
 		case "exit", "quit":
@@ -321,17 +620,23 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 
 func printHeader() {
 	fmt.Println()
-	fmt.Println("WhatsDown")
 	fmt.Println("Personal WhatsApp CLI")
 	fmt.Println("Type help to explore the features.")
-	fmt.Println("Press Ctrl+C to disconnect.")
 	fmt.Println()
 }
 
 func printHelp() {
 	fmt.Println("Available commands:")
 	fmt.Println("  help      Show this help message")
-	fmt.Println("  send      Send a message: send <phone> <message>")
+	fmt.Println("  send      Send a text message: send <phone/contact> <message>")
+	fmt.Println("  media     Send media/file: media <phone/contact> <file-path> [caption]")
+	fmt.Println("  inspect   Show recent messages: inspect <contact> [count]")
+	fmt.Println("  chats     Show recent active chats")
+	fmt.Println("  contacts  List synced contacts: contacts [search]")
+	fmt.Println("  check     Check if phone number is on WhatsApp: check <phone>")
+	fmt.Println("  reply     Reply to a message: reply <contact> [message-number] <message>")
+	fmt.Println("  react     React to a message: react <contact> <message-number> <emoji>")
+	fmt.Println("  search    Search session messages: search <text>")
 	fmt.Println("  status    Show the connected WhatsApp account")
 	fmt.Println("  setup     Show pairing status")
 	fmt.Println("  exit      Disconnect and exit WhatsDown")
@@ -352,9 +657,45 @@ func splitRecipientMessage(ctx context.Context, client *whatsapp.Client, args []
 	}
 	for split := len(args) - 1; split > 0; split-- {
 		recipient := strings.Join(args[:split], " ")
-		if _, err := client.ResolveRecipient(ctx, recipient); err == nil {
+		if _, err := client.FindContactTarget(ctx, recipient); err == nil {
 			return recipient, strings.Join(args[split:], " "), nil
 		}
 	}
 	return "", "", fmt.Errorf("contact not found: %s", strings.Join(args[:len(args)-1], " "))
 }
+
+func parseMediaArgs(ctx context.Context, client *whatsapp.Client, args []string) (string, string, string, error) {
+	if len(args) < 2 {
+		return "", "", "", errors.New("usage: media <contact> <file-path> [caption]")
+	}
+
+	// 1. Try finding a split where args[i] or args[i:j] is an existing file on disk
+	for i := 1; i < len(args); i++ {
+		recipientCandidate := strings.Join(args[:i], " ")
+		for j := i + 1; j <= len(args); j++ {
+			pathCandidate := strings.Trim(strings.Join(args[i:j], " "), `"'`)
+			if fi, err := os.Stat(pathCandidate); err == nil && !fi.IsDir() {
+				caption := strings.Join(args[j:], " ")
+				return recipientCandidate, pathCandidate, caption, nil
+			}
+		}
+	}
+
+	// 2. Fallback: try finding a matching contact for the recipient prefix
+	for split := len(args) - 1; split > 0; split-- {
+		recipient := strings.Join(args[:split], " ")
+		if _, err := client.FindContactTarget(ctx, recipient); err == nil {
+			filePath := strings.Trim(args[split], `"'`)
+			caption := strings.Join(args[split+1:], " ")
+			return recipient, filePath, caption, nil
+		}
+	}
+
+	// 3. Default fallback
+	recipient := args[0]
+	filePath := strings.Trim(args[1], `"'`)
+	caption := strings.Join(args[2:], " ")
+	return recipient, filePath, caption, nil
+}
+
+

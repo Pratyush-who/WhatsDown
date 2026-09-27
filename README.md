@@ -12,6 +12,8 @@ pstw send 8005331766 "Bring me chocolate"
 
 pstw chats
 pstw messages Pratyush
+pstw inspect Pratyush
+pstw inspect Pratyush 20
 pstw contacts
 pstw check 8005331766
 
@@ -75,6 +77,16 @@ Example:
 pstw chats
 pstw messages Pratyush
 ```
+
+Inspect the latest messages in a chat. The default is 10 messages; provide any positive count when needed:
+
+```powershell
+pstw inspect Pratyush
+pstw inspect 8005331766 5
+pstw inspect Pratyush 20
+```
+
+Messages are printed oldest-to-newest within the selected window. `YOU -->` identifies outgoing messages, while the sender followed by `<--` identifies incoming messages. Inspection uses messages already recorded in `data/messages.json`; run the client/listener long enough to receive new messages before inspecting them.
 
 ### Replies
 
@@ -624,24 +636,6 @@ Pratyush Mehra       +91 8005331766
 Rahul Sharma         +91 9876543210
 Ankit                +91 9123456780
 ```
-
-Search:
-
-```powershell
-pstw contacts Pratyush
-```
-
-Example:
-
-```text
-1 result
-
-Pratyush Mehra
-+91 8005331766
-WhatsApp: yes
-```
-
----
 
 # WhatsApp Number Check
 
