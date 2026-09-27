@@ -21,16 +21,18 @@ import (
 var ErrNotPaired = errors.New("no WhatsApp device is paired")
 
 type Client struct {
-	container    *sqlstore.Container
-	device       *whatsmeow.Client
-	messagePath  string
-	mu           sync.RWMutex
-	messages     []Message
-	messageIndex map[string]int // maps msg.ID + "\x00" + chatJID -> slice index
-	saveCh       chan struct{}
-	stopSave     chan struct{}
-	saveWg       sync.WaitGroup
-	historyDone  chan struct{}
+	container       *sqlstore.Container
+	device          *whatsmeow.Client
+	messagePath     string
+	mu              sync.RWMutex
+	messages        []Message
+	messageIndex    map[string]int // maps msg.ID + "\x00" + chatJID -> slice index
+	saveCh          chan struct{}
+	stopSave        chan struct{}
+	saveWg          sync.WaitGroup
+	historyDone     chan struct{}
+	schedules       *ScheduleStore
+	schedulerCancel context.CancelFunc
 }
 
 func New(ctx context.Context, dataDir string) (*Client, error) {
@@ -59,6 +61,8 @@ func New(ctx context.Context, dataDir string) (*Client, error) {
 	}
 	device.Log = waLog.Noop
 
+	schedStore, _ := NewScheduleStore(dataDir)
+
 	client := &Client{
 		container:    container,
 		messagePath:  filepath.Join(dataDir, "messages.json"),
@@ -66,6 +70,7 @@ func New(ctx context.Context, dataDir string) (*Client, error) {
 		saveCh:       make(chan struct{}, 1),
 		stopSave:     make(chan struct{}),
 		historyDone:  make(chan struct{}, 1),
+		schedules:    schedStore,
 	}
 
 	if data, readErr := os.ReadFile(client.messagePath); readErr == nil {
@@ -165,7 +170,32 @@ func (client *Client) record(message Message) {
 	client.scheduleSave()
 }
 
+func (client *Client) startScheduler(ctx context.Context) {
+	schedCtx, cancel := context.WithCancel(ctx)
+	client.schedulerCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		// Run immediate check on start
+		_, _ = client.ProcessSchedules(schedCtx)
+
+		for {
+			select {
+			case <-schedCtx.Done():
+				return
+			case <-ticker.C:
+				_, _ = client.ProcessSchedules(schedCtx)
+			}
+		}
+	}()
+}
+
 func (client *Client) Close() error {
+	if client.schedulerCancel != nil {
+		client.schedulerCancel()
+	}
 	close(client.stopSave)
 	client.saveWg.Wait()
 
@@ -208,6 +238,7 @@ func (client *Client) Connect(ctx context.Context, renderQR bool) error {
 		if err := client.device.ConnectContext(ctx); err != nil {
 			return fmt.Errorf("connect to WhatsApp: %w", err)
 		}
+		client.startScheduler(ctx)
 		return nil
 	}
 
@@ -229,6 +260,7 @@ func (client *Client) Connect(ctx context.Context, renderQR bool) error {
 			}
 		case item == whatsmeow.QRChannelSuccess:
 			fmt.Println("Authentication successful.")
+			client.startScheduler(ctx)
 		case item.Event == whatsmeow.QRChannelEventError:
 			return fmt.Errorf("WhatsApp pairing failed: %w", item.Error)
 		case item == whatsmeow.QRChannelTimeout:

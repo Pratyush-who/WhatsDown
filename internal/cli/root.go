@@ -3,9 +3,11 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -24,7 +26,17 @@ func New() *cobra.Command {
 		Short: "Personal WhatsApp terminal client",
 		RunE:  runConnection,
 	}
-	root.AddCommand(setupCommand(), statusCommand(), sendCommand(), mediaCommand(), contactsCommand(), checkCommand(), chatsCommand(), messagesCommand(), inspectCommand(), replyCommand(), reactCommand(), searchCommand(), listenCommand())
+	root.AddCommand(
+		setupCommand(),
+		statusCommand(),
+		sendCommand(),
+		mediaCommand(),
+		scheduleCommand(),
+		daemonCommand(),
+		chatsCommand(),
+		inspectCommand(),
+		completionCommand(root),
+	)
 	return root
 }
 
@@ -67,6 +79,12 @@ func sendCommand() *cobra.Command {
 		Use:   "send <recipient> [message]",
 		Short: "Send a text message or file",
 		Args:  cobra.MinimumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeContacts(toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if filePath == "" && len(args) < 2 {
 				return errors.New("message is required unless --file is used")
@@ -105,6 +123,15 @@ func mediaCommand() *cobra.Command {
 		Use:   "media <recipient> <file-path> [caption]",
 		Short: "Send an image, video, audio, or document",
 		Args:  cobra.MinimumNArgs(2),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeContacts(toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return nil, cobra.ShellCompDirectiveDefault
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd, true, func(ctx context.Context, client *whatsapp.Client) error {
 				recipient, filePath, parsedCaption, err := parseMediaArgs(ctx, client, args)
@@ -124,48 +151,6 @@ func mediaCommand() *cobra.Command {
 	}
 	command.Flags().StringVarP(&caption, "caption", "c", "", "caption for the media file")
 	return command
-}
-
-func contactsCommand() *cobra.Command {
-	return &cobra.Command{Use: "contacts [search]", Short: "List synced contacts", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		query := ""
-		if len(args) == 1 {
-			query = args[0]
-		}
-		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
-			contacts, err := client.Contacts(ctx)
-			if err != nil {
-				return err
-			}
-			for jid, contact := range contacts {
-				name := contact.FullName
-				if name == "" {
-					name = contact.PushName
-				}
-				if query == "" || strings.Contains(strings.ToLower(name), strings.ToLower(query)) {
-					fmt.Printf("%s\t%s\n", name, jid.String())
-				}
-			}
-			return nil
-		})
-	}}
-}
-
-func checkCommand() *cobra.Command {
-	return &cobra.Command{Use: "check <phone-number>", Short: "Check whether a number uses WhatsApp", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
-			jid, ok, err := client.CheckNumber(ctx, args[0])
-			if err != nil {
-				return err
-			}
-			if ok {
-				fmt.Printf("WhatsApp: YES (%s)\n", jid.String())
-			} else {
-				fmt.Println("WhatsApp: NO")
-			}
-			return nil
-		})
-	}}
 }
 
 func chatsCommand() *cobra.Command {
@@ -203,48 +188,33 @@ func chatsCommand() *cobra.Command {
 	}}
 }
 
-func messagesCommand() *cobra.Command {
-	return &cobra.Command{Use: "messages <chat>", Short: "Show messages seen during this session", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
-			target, err := client.FindContactTarget(ctx, args[0])
-			if err != nil {
-				return err
-			}
-			messages := client.MessagesForTarget(target)
-			if len(messages) == 0 {
-				fmt.Println("No messages seen for this contact.")
-				return nil
-			}
-			for _, message := range messages {
-				direction := "<--"
-				sender := target.DisplayName
-				if message.FromMe {
-					direction = "-->"
-					sender = "YOU"
-				}
-				fmt.Printf("[%d] %s\t%s %s\n    %s\n", message.Index, message.At.Format("15:04"), sender, direction, message.Text)
-			}
-			return nil
-		})
-	}}
-}
-
 func inspectCommand() *cobra.Command {
-	return &cobra.Command{Use: "inspect <chat> [count]", Short: "Show the latest messages in a chat (combined sent & received)", Args: cobra.MinimumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		chat, count, err := parseInspectArgs(args)
-		if err != nil {
-			return err
-		}
-		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
-			target, err := client.FindContactTarget(ctx, chat)
+	return &cobra.Command{
+		Use:   "inspect <chat> [count]",
+		Short: "Show the latest messages in a chat (combined sent & received)",
+		Args:  cobra.MinimumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeContacts(toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			chat, count, err := parseInspectArgs(args)
 			if err != nil {
 				return err
 			}
-			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
-			printRecentMessages(client, target, count)
-			return nil
-		})
-	}}
+			return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
+				target, err := client.FindContactTarget(ctx, chat)
+				if err != nil {
+					return err
+				}
+				_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+				printRecentMessages(client, target, count)
+				return nil
+			})
+		},
+	}
 }
 
 func max(left, right int) int {
@@ -317,58 +287,6 @@ func printRecentMessages(client *whatsapp.Client, target *whatsapp.ContactTarget
 	}
 }
 
-func replyCommand() *cobra.Command {
-	return &cobra.Command{Use: "reply <chat> [message-number] <message>", Short: "Reply to a recent message", Args: cobra.MinimumNArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
-		index := 0
-		textStart := 1
-		if len(args) > 2 {
-			parsed, err := strconv.Atoi(args[1])
-			if err == nil {
-				index = parsed
-				textStart = 2
-			}
-		}
-		return withClient(cmd, true, func(ctx context.Context, client *whatsapp.Client) error {
-			return client.Reply(ctx, args[0], strings.Join(args[textStart:], " "), index)
-		})
-	}}
-}
-
-func reactCommand() *cobra.Command {
-	return &cobra.Command{Use: "react <chat> <message-number> <emoji>", Short: "React to a recent message", Args: cobra.ExactArgs(3), RunE: func(cmd *cobra.Command, args []string) error {
-		index, err := strconv.Atoi(args[1])
-		if err != nil || index < 1 {
-			return errors.New("message-number must be a positive integer")
-		}
-		return withClient(cmd, true, func(ctx context.Context, client *whatsapp.Client) error {
-			return client.React(ctx, args[0], index, args[2])
-		})
-	}}
-}
-
-func searchCommand() *cobra.Command {
-	return &cobra.Command{Use: "search <text>", Short: "Search messages seen during this session", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return withClient(cmd, false, func(_ context.Context, client *whatsapp.Client) error {
-			for _, message := range client.Messages() {
-				if strings.Contains(strings.ToLower(message.Text), strings.ToLower(args[0])) {
-					fmt.Printf("[%d] %s: %s\n", message.Index, message.Chat.String(), message.Text)
-				}
-			}
-			return nil
-		})
-	}}
-}
-
-func listenCommand() *cobra.Command {
-	return &cobra.Command{Use: "listen", Short: "Listen for incoming messages", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		return withClient(cmd, true, func(ctx context.Context, _ *whatsapp.Client) error {
-			fmt.Println("Listening. Press Ctrl+C to stop.")
-			<-ctx.Done()
-			return nil
-		})
-	}}
-}
-
 func runConnection(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -425,6 +343,232 @@ func tokenizeLine(line string) []string {
 	return tokens
 }
 
+func scheduleCommand() *cobra.Command {
+	var (
+		atTime   string
+		inTime   string
+		filePath string
+		caption  string
+		startBg  bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "schedule <recipient> [message]",
+		Short: "Schedule a message or media to be sent at a future time",
+		Args:  cobra.MinimumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeContacts(toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(c *cobra.Command, args []string) error {
+			if atTime == "" && inTime == "" {
+				return errors.New("either --at or --in is required (e.g. --at \"15-10-2026 00:00\" or --in 2h)")
+			}
+
+			var targetTime time.Time
+			var err error
+			if atTime != "" {
+				targetTime, err = whatsapp.ParseScheduleTime(atTime, time.Local)
+			} else {
+				targetTime, err = whatsapp.ParseScheduleTime("in "+inTime, time.Local)
+			}
+			if err != nil {
+				return err
+			}
+
+			recipient := ""
+			text := ""
+			if filePath != "" {
+				recipient = strings.Join(args, " ")
+			} else {
+				if len(args) < 2 {
+					return errors.New("message is required unless --file is used")
+				}
+				recipient = args[0]
+				text = strings.Join(args[1:], " ")
+			}
+
+			store, err := whatsapp.NewScheduleStore("data")
+			if err != nil {
+				return err
+			}
+
+			item, err := store.Add(recipient, text, filePath, caption, targetTime)
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("Message scheduled successfully!")
+			fmt.Printf("ID:           %s\n", item.ID)
+			fmt.Printf("Recipient:    %s\n", item.Recipient)
+			if item.Text != "" {
+				fmt.Printf("Message:      %s\n", item.Text)
+			}
+			if item.MediaPath != "" {
+				fmt.Printf("Media:        %s\n", item.MediaPath)
+			}
+			fmt.Printf("Scheduled At: %s (%s from now)\n", item.ScheduledAt.Format("2006-01-02 15:04:05"), time.Until(item.ScheduledAt).Round(time.Minute))
+
+			if startBg {
+				if err := startBackgroundDaemonProcess(); err != nil {
+					// It's ok if daemon is already running or cannot be spawned
+				} else {
+					fmt.Println("Background daemon launched to ensure delivery when terminal is closed.")
+				}
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&atTime, "at", "", "absolute time (e.g. '15-10-2026 00:00', 'tomorrow 09:00', '18:00')")
+	cmd.Flags().StringVar(&inTime, "in", "", "relative duration (e.g. '10m', '2h', '1d')")
+	cmd.Flags().StringVar(&filePath, "file", "", "media or document file to schedule")
+	cmd.Flags().StringVar(&caption, "caption", "", "caption for scheduled media")
+	cmd.Flags().BoolVar(&startBg, "daemon", true, "start background daemon if not already running")
+
+	cmd.AddCommand(scheduleListCommand(), scheduleCancelCommand(), scheduleProcessCommand(), startDaemonCommand())
+	return cmd
+}
+
+func scheduleListCommand() *cobra.Command {
+	var includeAll bool
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List scheduled messages",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			store, err := whatsapp.NewScheduleStore("data")
+			if err != nil {
+				return err
+			}
+			printScheduleList(store.List(includeAll))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&includeAll, "all", "a", false, "include completed and cancelled messages")
+	return cmd
+}
+
+func scheduleCancelCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel <id>",
+		Short: "Cancel a scheduled message by ID",
+		Args:  cobra.ExactArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeScheduleIDs(toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(_ *cobra.Command, args []string) error {
+			store, err := whatsapp.NewScheduleStore("data")
+			if err != nil {
+				return err
+			}
+			if err := store.Cancel(args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("Schedule %s cancelled.\n", args[0])
+			return nil
+		},
+	}
+}
+
+func scheduleProcessCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "process",
+		Short: "Connect and process due scheduled messages now",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
+				count, err := client.ProcessSchedules(ctx)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Processed %d scheduled message(s).\n", count)
+				return nil
+			})
+		},
+	}
+}
+
+func daemonCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "daemon",
+		Short: "Run WhatsDown background worker for scheduled messages",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
+				fmt.Println("WhatsDown background daemon is running.")
+				fmt.Println("Scheduled messages will be sent automatically at their designated times.")
+				fmt.Println("Press Ctrl+C to stop.")
+				<-ctx.Done()
+				return nil
+			})
+		},
+	}
+}
+
+func startDaemonCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "start-daemon",
+		Short: "Launch background daemon process (detached, no window)",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := startBackgroundDaemonProcess(); err != nil {
+				return err
+			}
+			fmt.Println("Background daemon started successfully.")
+			return nil
+		},
+	}
+}
+
+func startBackgroundDaemonProcess() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable: %w", err)
+	}
+	cmd := exec.Command(exe, "daemon")
+	cmd.Dir = "."
+	setDetachedProcess(cmd)
+	return cmd.Start()
+}
+
+func printScheduleList(items []whatsapp.ScheduledMessage) {
+	if len(items) == 0 {
+		fmt.Println("No scheduled messages found.")
+		return
+	}
+	fmt.Printf("%-18s %-20s %-20s %-12s %s\n", "ID", "RECIPIENT", "SCHEDULED AT", "STATUS", "MESSAGE")
+	fmt.Println(strings.Repeat("-", 90))
+	for _, item := range items {
+		msg := item.Text
+		if item.MediaPath != "" {
+			if item.Caption != "" {
+				msg = fmt.Sprintf("[%s] %s", filepath.Base(item.MediaPath), item.Caption)
+			} else {
+				msg = fmt.Sprintf("[%s]", filepath.Base(item.MediaPath))
+			}
+		}
+		if len(msg) > 30 {
+			msg = msg[:27] + "..."
+		}
+		fmt.Printf("%-18s %-20s %-20s %-12s %s\n",
+			item.ID,
+			truncateStr(item.Recipient, 20),
+			item.ScheduledAt.Format("2006-01-02 15:04"),
+			string(item.Status),
+			msg,
+		)
+	}
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen-3] + "..."
+	}
+	return s
+}
+
 func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 	input := bufio.NewScanner(os.Stdin)
 	for {
@@ -477,6 +621,20 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 				break
 			}
 			fmt.Println("Media sent.")
+		case "schedule":
+			handleInteractiveSchedule(ctx, client, parts[1:])
+		case "schedules":
+			printScheduleList(client.Schedules().List(false))
+		case "cancel":
+			if len(parts) < 2 {
+				fmt.Println("Usage: cancel <schedule-id>")
+				break
+			}
+			if err := client.Schedules().Cancel(parts[1]); err != nil {
+				fmt.Printf("Cancel failed: %v\n", err)
+				break
+			}
+			fmt.Printf("Schedule %s cancelled.\n", parts[1])
 		case "status":
 			printStatus(client)
 		case "inspect":
@@ -496,25 +654,6 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 			}
 			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
 			printRecentMessages(client, target, count)
-		case "contacts":
-			query := ""
-			if len(parts) >= 2 {
-				query = strings.Join(parts[1:], " ")
-			}
-			contacts, err := client.Contacts(ctx)
-			if err != nil {
-				fmt.Printf("Contacts failed: %v\n", err)
-				break
-			}
-			for jid, contact := range contacts {
-				name := contact.FullName
-				if name == "" {
-					name = contact.PushName
-				}
-				if query == "" || strings.Contains(strings.ToLower(name), strings.ToLower(query)) {
-					fmt.Printf("%s\t%s\n", name, jid.String())
-				}
-			}
 		case "chats":
 			seen := map[string]time.Time{}
 			for _, message := range client.Messages() {
@@ -543,68 +682,12 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 				}
 				fmt.Printf("%d. %s\t[%s]\n", i+1, name, ch.at.Format("2006-01-02 15:04"))
 			}
-		case "check":
-			if len(parts) < 2 {
-				fmt.Println("Usage: check <phone-number>")
-				break
-			}
-			jid, ok, err := client.CheckNumber(ctx, parts[1])
-			if err != nil {
-				fmt.Printf("Check failed: %v\n", err)
-				break
-			}
-			if ok {
-				fmt.Printf("WhatsApp: YES (%s)\n", jid.String())
-			} else {
-				fmt.Println("WhatsApp: NO")
-			}
-		case "reply":
-			if len(parts) < 3 {
-				fmt.Println("Usage: reply <chat> [message-number] <message>")
-				break
-			}
-			index := 0
-			textStart := 2
-			if len(parts) > 3 {
-				if parsed, err := strconv.Atoi(parts[2]); err == nil {
-					index = parsed
-					textStart = 3
-				}
-			}
-			if err := client.Reply(ctx, parts[1], strings.Join(parts[textStart:], " "), index); err != nil {
-				fmt.Printf("Reply failed: %v\n", err)
-				break
-			}
-			fmt.Println("Reply sent.")
-		case "react":
-			if len(parts) < 4 {
-				fmt.Println("Usage: react <chat> <message-number> <emoji>")
-				break
-			}
-			index, err := strconv.Atoi(parts[2])
-			if err != nil || index < 1 {
-				fmt.Println("message-number must be a positive integer")
-				break
-			}
-			if err := client.React(ctx, parts[1], index, parts[3]); err != nil {
-				fmt.Printf("React failed: %v\n", err)
-				break
-			}
-			fmt.Println("Reaction sent.")
-		case "search":
-			if len(parts) < 2 {
-				fmt.Println("Usage: search <text>")
-				break
-			}
-			query := strings.Join(parts[1:], " ")
-			for _, message := range client.Messages() {
-				if strings.Contains(strings.ToLower(message.Text), strings.ToLower(query)) {
-					fmt.Printf("[%d] %s: %s\n", message.Index, message.Chat.String(), message.Text)
-				}
-			}
+		case "daemon":
+			fmt.Println("Note: The scheduler daemon is already active inside this interactive session.")
+			fmt.Println("To run it in the background when the terminal is closed, run 'pstw daemon' from your system shell.")
 		case "setup":
-			fmt.Println("This account is already connected. Use Ctrl+C to disconnect.")
-		case "exit", "quit":
+			fmt.Println("This account is already connected. Type quit or press Ctrl+C to disconnect.")
+		case "quit":
 			return nil
 		default:
 			fmt.Printf("Unknown command %q. Type help to see available commands.\n", command)
@@ -616,6 +699,122 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 		default:
 		}
 	}
+}
+
+func handleInteractiveSchedule(ctx context.Context, client *whatsapp.Client, parts []string) {
+	if len(parts) == 0 || parts[0] == "list" {
+		printScheduleList(client.Schedules().List(false))
+		return
+	}
+
+	if parts[0] == "cancel" {
+		if len(parts) < 2 {
+			fmt.Println("Usage: schedule cancel <id>")
+			return
+		}
+		if err := client.Schedules().Cancel(parts[1]); err != nil {
+			fmt.Printf("Cancel failed: %v\n", err)
+			return
+		}
+		fmt.Printf("Schedule %s cancelled.\n", parts[1])
+		return
+	}
+
+	if parts[0] == "process" {
+		count, err := client.ProcessSchedules(ctx)
+		if err != nil {
+			fmt.Printf("Process failed: %v\n", err)
+			return
+		}
+		fmt.Printf("Processed %d scheduled message(s).\n", count)
+		return
+	}
+
+	var atStr, inStr, fileStr, captionStr string
+	var remaining []string
+	for i := 0; i < len(parts); i++ {
+		p := parts[i]
+		if p == "--at" && i+1 < len(parts) {
+			atStr = parts[i+1]
+			i++
+		} else if strings.HasPrefix(p, "--at=") {
+			atStr = strings.TrimPrefix(p, "--at=")
+		} else if p == "--in" && i+1 < len(parts) {
+			inStr = parts[i+1]
+			i++
+		} else if strings.HasPrefix(p, "--in=") {
+			inStr = strings.TrimPrefix(p, "--in=")
+		} else if p == "--file" && i+1 < len(parts) {
+			fileStr = parts[i+1]
+			i++
+		} else if strings.HasPrefix(p, "--file=") {
+			fileStr = strings.TrimPrefix(p, "--file=")
+		} else if p == "--caption" && i+1 < len(parts) {
+			captionStr = parts[i+1]
+			i++
+		} else if strings.HasPrefix(p, "--caption=") {
+			captionStr = strings.TrimPrefix(p, "--caption=")
+		} else {
+			remaining = append(remaining, p)
+		}
+	}
+
+	if atStr == "" && inStr == "" {
+		fmt.Println("Usage: schedule <recipient> <message> --at \"<time>\" (or --in <duration>)")
+		fmt.Println("Example: schedule 8005331766 \"Happy Birthday!\" --at \"15-10-2026 00:00\"")
+		fmt.Println("Example: schedule \"Yash Chatrath\" \"Meeting in 2h\" --in 2h")
+		return
+	}
+
+	var targetTime time.Time
+	var err error
+	if atStr != "" {
+		targetTime, err = whatsapp.ParseScheduleTime(atStr, time.Local)
+	} else {
+		targetTime, err = whatsapp.ParseScheduleTime("in "+inStr, time.Local)
+	}
+	if err != nil {
+		fmt.Printf("Schedule failed: %v\n", err)
+		return
+	}
+
+	if len(remaining) < 1 && fileStr == "" {
+		fmt.Println("Usage: schedule <recipient> <message> --at \"<time>\"")
+		return
+	}
+
+	recipient := ""
+	text := ""
+	if fileStr != "" {
+		recipient = strings.Join(remaining, " ")
+	} else {
+		if len(remaining) < 2 {
+			fmt.Println("Recipient and message text are required.")
+			return
+		}
+		recipient, text, err = splitRecipientMessage(ctx, client, remaining)
+		if err != nil {
+			recipient = remaining[0]
+			text = strings.Join(remaining[1:], " ")
+		}
+	}
+
+	item, err := client.Schedules().Add(recipient, text, fileStr, captionStr, targetTime)
+	if err != nil {
+		fmt.Printf("Schedule failed: %v\n", err)
+		return
+	}
+
+	fmt.Println("Message scheduled successfully!")
+	fmt.Printf("ID:           %s\n", item.ID)
+	fmt.Printf("Recipient:    %s\n", item.Recipient)
+	if item.Text != "" {
+		fmt.Printf("Message:      %s\n", item.Text)
+	}
+	if item.MediaPath != "" {
+		fmt.Printf("Media:        %s\n", item.MediaPath)
+	}
+	fmt.Printf("Scheduled At: %s (%s from now)\n", item.ScheduledAt.Format("2006-01-02 15:04:05"), time.Until(item.ScheduledAt).Round(time.Minute))
 }
 
 func printHeader() {
@@ -630,16 +829,13 @@ func printHelp() {
 	fmt.Println("  help      Show this help message")
 	fmt.Println("  send      Send a text message: send <phone/contact> <message>")
 	fmt.Println("  media     Send media/file: media <phone/contact> <file-path> [caption]")
+	fmt.Println("  schedule  Schedule a message: schedule <recipient> <message> --at \"<time>\"")
+	fmt.Println("  schedules List scheduled messages")
+	fmt.Println("  cancel    Cancel a scheduled message: cancel <schedule-id>")
 	fmt.Println("  inspect   Show recent messages: inspect <contact> [count]")
 	fmt.Println("  chats     Show recent active chats")
-	fmt.Println("  contacts  List synced contacts: contacts [search]")
-	fmt.Println("  check     Check if phone number is on WhatsApp: check <phone>")
-	fmt.Println("  reply     Reply to a message: reply <contact> [message-number] <message>")
-	fmt.Println("  react     React to a message: react <contact> <message-number> <emoji>")
-	fmt.Println("  search    Search session messages: search <text>")
 	fmt.Println("  status    Show the connected WhatsApp account")
 	fmt.Println("  setup     Show pairing status")
-	fmt.Println("  exit      Disconnect and exit WhatsDown")
 	fmt.Println("  quit      Disconnect and exit WhatsDown")
 }
 
@@ -697,5 +893,119 @@ func parseMediaArgs(ctx context.Context, client *whatsapp.Client, args []string)
 	caption := strings.Join(args[2:], " ")
 	return recipient, filePath, caption, nil
 }
+
+func completionCommand(root *cobra.Command) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "completion [bash|zsh|fish|powershell]",
+		Short: "Generate shell completion script",
+		Long: `Generate shell completion script for WhatsDown (PSTW).
+
+To load completions:
+
+PowerShell:
+  # To load completions in your current PowerShell session:
+  pstw completion powershell | Out-String | Invoke-Expression
+
+  # To load completions for every new PowerShell session, run:
+  Add-Content -Path $PROFILE -Value "pstw completion powershell | Out-String | Invoke-Expression"
+
+Bash:
+  # To load completions in your current bash session:
+  source <(pstw completion bash)
+
+  # To load completions for every new bash session, run:
+  pstw completion bash > /etc/bash_completion.d/pstw
+
+Zsh:
+  # To load completions in your current zsh session:
+  source <(pstw completion zsh)
+
+  # To load completions for every new zsh session, run:
+  pstw completion zsh > "${fpath[1]}/_pstw"
+
+Fish:
+  # To load completions in your current fish session:
+  pstw completion fish | source
+
+  # To load completions for every new fish session, run:
+  pstw completion fish > ~/.config/fish/completions/pstw.fish
+`,
+		DisableFlagsInUseLine: true,
+		ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
+		Args:                  cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch args[0] {
+			case "bash":
+				return root.GenBashCompletion(os.Stdout)
+			case "zsh":
+				return root.GenZshCompletion(os.Stdout)
+			case "fish":
+				return root.GenFishCompletion(os.Stdout, true)
+			case "powershell":
+				return root.GenPowerShellCompletionWithDesc(os.Stdout)
+			default:
+				return fmt.Errorf("unsupported shell %q", args[0])
+			}
+		},
+	}
+	return cmd
+}
+
+func completeContacts(toComplete string) []string {
+	var suggestions []string
+	seen := make(map[string]bool)
+
+	// 1. From schedules
+	if store, err := whatsapp.NewScheduleStore("data"); err == nil {
+		for _, s := range store.List(true) {
+			rec := strings.TrimSpace(s.Recipient)
+			if rec != "" && !seen[rec] {
+				seen[rec] = true
+				if strings.HasPrefix(strings.ToLower(rec), strings.ToLower(toComplete)) {
+					suggestions = append(suggestions, rec)
+				}
+			}
+		}
+	}
+
+	// 2. From messages.json
+	if data, err := os.ReadFile(filepath.Join("data", "messages.json")); err == nil {
+		var messages []whatsapp.Message
+		if err := json.Unmarshal(data, &messages); err == nil {
+			for _, m := range messages {
+				chatUser := m.Chat.User
+				if chatUser != "" && !seen[chatUser] {
+					seen[chatUser] = true
+					if strings.HasPrefix(chatUser, toComplete) {
+						suggestions = append(suggestions, chatUser)
+					}
+				}
+			}
+		}
+	}
+
+	return suggestions
+}
+
+func completeScheduleIDs(toComplete string) []string {
+	var suggestions []string
+	if store, err := whatsapp.NewScheduleStore("data"); err == nil {
+		for _, item := range store.List(false) {
+			if strings.HasPrefix(item.ID, toComplete) {
+				desc := item.Recipient
+				if item.Text != "" {
+					desc += ": " + item.Text
+				}
+				if len(desc) > 30 {
+					desc = desc[:27] + "..."
+				}
+				suggestions = append(suggestions, fmt.Sprintf("%s\t%s", item.ID, desc))
+			}
+		}
+	}
+	return suggestions
+}
+
+
 
 
