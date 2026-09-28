@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,11 @@ func New(ctx context.Context, dataDir string) (*Client, error) {
 		return nil, fmt.Errorf("open WhatsApp session store: %w", err)
 	}
 
+	if err := container.Upgrade(ctx); err != nil {
+		_ = container.Close()
+		return nil, fmt.Errorf("upgrade WhatsApp database: %w", err)
+	}
+
 	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		_ = container.Close()
@@ -90,7 +96,11 @@ func New(ctx context.Context, dataDir string) (*Client, error) {
 }
 
 func sqliteAddress(path string) string {
-	return "file:" + filepath.ToSlash(path) + "?_foreign_keys=on"
+	cleanPath := filepath.ToSlash(path)
+	if !strings.HasPrefix(cleanPath, "/") && len(cleanPath) > 1 && cleanPath[1] == ':' {
+		return "file:///" + cleanPath + "?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL"
+	}
+	return "file:" + cleanPath + "?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL"
 }
 
 func (client *Client) WhatsApp() *whatsmeow.Client {

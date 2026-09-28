@@ -61,10 +61,47 @@ func statusCommand() *cobra.Command {
 	}
 }
 
+func getDataDir() string {
+	if envDir := os.Getenv("WHATSDOWN_DATA_DIR"); envDir != "" {
+		return envDir
+	}
+	if envDir := os.Getenv("PSTW_DATA_DIR"); envDir != "" {
+		return envDir
+	}
+
+	// 1. Check next to the executable (portable installation / pstw.exe)
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		// Skip temp directory used by 'go run'
+		if !strings.Contains(strings.ToLower(exeDir), "temp") {
+			exeData := filepath.Join(exeDir, "data")
+			if stat, err := os.Stat(exeData); err == nil && stat.IsDir() {
+				return exeData
+			}
+			return exeData
+		}
+	}
+
+	// 2. If running in source repo with existing whatsapp.db or schedules.json
+	if stat, err := os.Stat("data"); err == nil && stat.IsDir() {
+		if _, err := os.Stat(filepath.Join("data", "whatsapp.db")); err == nil {
+			if abs, err := filepath.Abs("data"); err == nil {
+				return abs
+			}
+			return "data"
+		}
+	}
+
+	if abs, err := filepath.Abs("data"); err == nil {
+		return abs
+	}
+	return "data"
+}
+
 func withClient(cmd *cobra.Command, renderQR bool, action func(context.Context, *whatsapp.Client) error) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client, err := whatsapp.New(ctx, filepath.Join("data"))
+	client, err := whatsapp.New(ctx, getDataDir())
 	if err != nil {
 		return err
 	}
@@ -293,7 +330,7 @@ func runConnection(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	dataDir := filepath.Join("data")
+	dataDir := getDataDir()
 	client, err := whatsapp.New(ctx, dataDir)
 	if err != nil {
 		return err
@@ -392,7 +429,7 @@ func scheduleCommand() *cobra.Command {
 				text = strings.Join(args[1:], " ")
 			}
 
-			store, err := whatsapp.NewScheduleStore("data")
+			store, err := whatsapp.NewScheduleStore(getDataDir())
 			if err != nil {
 				return err
 			}
@@ -440,7 +477,7 @@ func scheduleListCommand() *cobra.Command {
 		Use:   "list",
 		Short: "List scheduled messages",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			store, err := whatsapp.NewScheduleStore("data")
+			store, err := whatsapp.NewScheduleStore(getDataDir())
 			if err != nil {
 				return err
 			}
@@ -464,7 +501,7 @@ func scheduleCancelCommand() *cobra.Command {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
 		RunE: func(_ *cobra.Command, args []string) error {
-			store, err := whatsapp.NewScheduleStore("data")
+			store, err := whatsapp.NewScheduleStore(getDataDir())
 			if err != nil {
 				return err
 			}
@@ -530,7 +567,7 @@ func startBackgroundDaemonProcess() error {
 		return fmt.Errorf("locate executable: %w", err)
 	}
 	cmd := exec.Command(exe, "daemon")
-	cmd.Dir = "."
+	cmd.Dir = filepath.Dir(exe)
 	setDetachedProcess(cmd)
 	return cmd.Start()
 }
@@ -1131,7 +1168,7 @@ func completeContacts(toComplete string) []string {
 	seen := make(map[string]bool)
 
 	// 1. From schedules
-	if store, err := whatsapp.NewScheduleStore("data"); err == nil {
+	if store, err := whatsapp.NewScheduleStore(getDataDir()); err == nil {
 		for _, s := range store.List(true) {
 			rec := strings.TrimSpace(s.Recipient)
 			if rec != "" && !seen[rec] {
@@ -1144,7 +1181,7 @@ func completeContacts(toComplete string) []string {
 	}
 
 	// 2. From messages.json (ignore group chats)
-	if data, err := os.ReadFile(filepath.Join("data", "messages.json")); err == nil {
+	if data, err := os.ReadFile(filepath.Join(getDataDir(), "messages.json")); err == nil {
 		var messages []whatsapp.Message
 		if err := json.Unmarshal(data, &messages); err == nil {
 			for _, m := range messages {
@@ -1167,7 +1204,7 @@ func completeContacts(toComplete string) []string {
 
 func completeScheduleIDs(toComplete string) []string {
 	var suggestions []string
-	if store, err := whatsapp.NewScheduleStore("data"); err == nil {
+	if store, err := whatsapp.NewScheduleStore(getDataDir()); err == nil {
 		for _, item := range store.List(false) {
 			if strings.HasPrefix(item.ID, toComplete) {
 				desc := item.Recipient
