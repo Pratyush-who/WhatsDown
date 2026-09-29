@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ func New() *cobra.Command {
 	root.AddCommand(
 		setupCommand(),
 		statusCommand(),
+		syncCommand(),
 		sendCommand(),
 		mediaCommand(),
 		scheduleCommand(),
@@ -69,20 +71,7 @@ func getDataDir() string {
 		return envDir
 	}
 
-	// 1. Check next to the executable (portable installation / pstw.exe)
-	if exePath, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exePath)
-		// Skip temp directory used by 'go run'
-		if !strings.Contains(strings.ToLower(exeDir), "temp") {
-			exeData := filepath.Join(exeDir, "data")
-			if stat, err := os.Stat(exeData); err == nil && stat.IsDir() {
-				return exeData
-			}
-			return exeData
-		}
-	}
-
-	// 2. If running in source repo with existing whatsapp.db or schedules.json
+	// 1. If running in source repo or working directory with existing data folder containing DB
 	if stat, err := os.Stat("data"); err == nil && stat.IsDir() {
 		if _, err := os.Stat(filepath.Join("data", "whatsapp.db")); err == nil {
 			if abs, err := filepath.Abs("data"); err == nil {
@@ -90,6 +79,25 @@ func getDataDir() string {
 			}
 			return "data"
 		}
+	}
+
+	// 2. Check next to the executable (portable installation with existing DB)
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		// Skip temp directory used by 'go run'
+		if !strings.Contains(strings.ToLower(exeDir), "temp") {
+			exeData := filepath.Join(exeDir, "data")
+			if stat, err := os.Stat(exeData); err == nil && stat.IsDir() {
+				if _, err := os.Stat(filepath.Join(exeData, "whatsapp.db")); err == nil {
+					return exeData
+				}
+			}
+		}
+	}
+
+	// 3. Persistent user config/data directory (e.g. %APPDATA%/whatsdown or ~/.config/whatsdown)
+	if configDir, err := os.UserConfigDir(); err == nil && configDir != "" {
+		return filepath.Join(configDir, "whatsdown")
 	}
 
 	if abs, err := filepath.Abs("data"); err == nil {
@@ -192,39 +200,231 @@ func mediaCommand() *cobra.Command {
 	return command
 }
 
-func chatsCommand() *cobra.Command {
-	return &cobra.Command{Use: "chats", Short: "Show chats seen during this session", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
-			seen := map[string]time.Time{}
-			for _, message := range client.Messages() {
-				chatKey := message.Chat.ToNonAD().String()
-				if message.At.After(seen[chatKey]) {
-					seen[chatKey] = message.At
+func syncCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync [chat]",
+		Short: "Fetch latest chats, contacts, app state, and message history from WhatsApp",
+		Args:  cobra.MaximumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeContacts(toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
+				target := ""
+				if len(args) > 0 {
+					target = args[0]
 				}
-			}
-			type chat struct {
-				jid string
-				at  time.Time
-			}
-			chats := make([]chat, 0, len(seen))
-			for jid, at := range seen {
-				chats = append(chats, chat{jid, at})
-			}
-			sort.Slice(chats, func(i, j int) bool { return chats[i].at.After(chats[j].at) })
-			for i, chat := range chats {
-				if i == 10 {
-					break
+				return handleSync(ctx, client, target)
+			})
+		},
+	}
+}
+
+func handleSync(ctx context.Context, client *whatsapp.Client, targetArg string) error {
+	pb := NewProgressBar(os.Stdout)
+	targetArg = strings.TrimSpace(targetArg)
+	if targetArg != "" {
+		target, err := client.FindContactTarget(ctx, targetArg)
+		if err != nil {
+			pb.StopWithError(fmt.Sprintf("Find contact failed: %v", err))
+			return err
+		}
+		pb.SetText(fmt.Sprintf("Syncing app state for %s...", target.DisplayName))
+		_ = client.SyncAppState(ctx, false)
+		if err := client.SyncChatWithProgress(ctx, target.PrimaryJID, 50, func(p whatsapp.SyncProgress) {
+			pb.Update(p)
+		}); err != nil {
+			pb.StopWithError(fmt.Sprintf("Sync failed: %v", err))
+			return err
+		}
+		pb.StopWithSuccess(fmt.Sprintf("Sync complete for %s", target.DisplayName))
+		fmt.Println()
+		printRecentMessages(client, target, 10)
+		return nil
+	}
+
+	count, err := client.SyncAllWithProgress(ctx, func(p whatsapp.SyncProgress) {
+		pb.Update(p)
+	})
+	if err != nil {
+		pb.StopWithError(fmt.Sprintf("Sync failed: %v", err))
+		return err
+	}
+	pb.StopWithSuccess(fmt.Sprintf("Sync complete! Updated app state and synced %d active chats", count))
+	fmt.Println()
+	printChatsList(ctx, client, 15)
+	return nil
+}
+
+func startInteractiveSync(ctx context.Context, client *whatsapp.Client, rl *readline.Instance, target string) {
+	target = strings.TrimSpace(target)
+	if client.IsSyncing() {
+		status := client.SyncStatus()
+		elapsed := time.Since(status.StartTime).Truncate(100 * time.Millisecond)
+		desc := status.Progress.Description
+		if desc == "" {
+			desc = status.Progress.StageName
+		}
+		fmt.Printf("Sync is already running in background: [%d/%d %s] %s (%s elapsed)\n",
+			status.Progress.StageIndex, status.Progress.StageTotal, status.Progress.StageName, desc, elapsed)
+		return
+	}
+
+	fmt.Println("Background sync started.")
+	fmt.Println("You can continue typing commands (chats, send, inspect, status, etc.) while sync runs.")
+
+	frameIdx := 0
+	ticker := time.NewTicker(120 * time.Millisecond)
+	stopTicker := make(chan struct{})
+	var stopOnce sync.Once
+
+	go func() {
+		for {
+			select {
+			case <-stopTicker:
+				ticker.Stop()
+				rl.SetPrompt(">> ")
+				rl.Refresh()
+				return
+			case <-ticker.C:
+				status := client.SyncStatus()
+				if !status.IsRunning {
+					return
 				}
-				target, _ := client.FindContactTarget(ctx, chat.jid)
-				name := chat.jid
-				if target != nil && target.DisplayName != "" {
-					name = fmt.Sprintf("%s (%s)", target.DisplayName, chat.jid)
+				frameIdx = (frameIdx + 1) % len(spinnerFrames)
+				frame := spinnerFrames[frameIdx]
+				var promptStr string
+				if status.Progress.StageTotal > 0 && status.Progress.Total > 0 {
+					pct := float64(status.Progress.Current) / float64(status.Progress.Total) * 100
+					promptStr = fmt.Sprintf("[Sync %s %d/%d %3.0f%% (%d/%d)] >> ",
+						frame, status.Progress.StageIndex, status.Progress.StageTotal, pct, status.Progress.Current, status.Progress.Total)
+				} else if status.Progress.StageName != "" {
+					promptStr = fmt.Sprintf("[Sync %s %s] >> ", frame, status.Progress.StageName)
+				} else {
+					promptStr = fmt.Sprintf("[Sync %s] >> ", frame)
 				}
-				fmt.Printf("%d. %s\t[%s]\n", i+1, name, chat.at.Format("2006-01-02 15:04"))
+				rl.SetPrompt(promptStr)
+				rl.Refresh()
 			}
-			return nil
+		}
+	}()
+
+	startTime := time.Now()
+	_, _ = client.StartBackgroundSync(ctx, target, nil, func(synced int, err error) {
+		stopOnce.Do(func() {
+			close(stopTicker)
 		})
-	}}
+		elapsed := time.Since(startTime).Truncate(100 * time.Millisecond)
+		if err != nil {
+			fmt.Fprintf(rl.Stdout(), "\n✖ WhatsApp sync failed: %v (%s)\n", err, elapsed)
+		} else if target != "" {
+			fmt.Fprintf(rl.Stdout(), "\n✔ WhatsApp sync complete for %s! (%s)\n", target, elapsed)
+		} else {
+			fmt.Fprintf(rl.Stdout(), "\n✔ WhatsApp sync complete! Synced %d active chats. (%s)\n", synced, elapsed)
+		}
+		rl.Refresh()
+	})
+}
+
+func startFallbackSync(ctx context.Context, client *whatsapp.Client, target string) {
+	target = strings.TrimSpace(target)
+	if client.IsSyncing() {
+		status := client.SyncStatus()
+		elapsed := time.Since(status.StartTime).Truncate(100 * time.Millisecond)
+		fmt.Printf("Sync is already running: [%d/%d %s] (%s elapsed)\n",
+			status.Progress.StageIndex, status.Progress.StageTotal, status.Progress.StageName, elapsed)
+		return
+	}
+
+	fmt.Println("Background sync started. You can continue typing commands.")
+	startTime := time.Now()
+	_, _ = client.StartBackgroundSync(ctx, target, nil, func(synced int, err error) {
+		elapsed := time.Since(startTime).Truncate(100 * time.Millisecond)
+		if err != nil {
+			fmt.Printf("\n✖ WhatsApp sync failed: %v (%s)\n>> ", err, elapsed)
+		} else if target != "" {
+			fmt.Printf("\n✔ WhatsApp sync complete for %s! (%s)\n>> ", target, elapsed)
+		} else {
+			fmt.Printf("\n✔ WhatsApp sync complete! Synced %d active chats. (%s)\n>> ", synced, elapsed)
+		}
+	})
+}
+
+func printChatsList(ctx context.Context, client *whatsapp.Client, limit int) {
+	if limit <= 0 {
+		limit = 15
+	}
+	seen := map[string]time.Time{}
+	for _, message := range client.Messages() {
+		chatKey := message.Chat.ToNonAD().String()
+		if message.At.After(seen[chatKey]) {
+			seen[chatKey] = message.At
+		}
+	}
+	if groups, err := client.WhatsApp().GetJoinedGroups(ctx); err == nil {
+		for _, group := range groups {
+			chatKey := group.JID.ToNonAD().String()
+			if _, exists := seen[chatKey]; !exists {
+				seen[chatKey] = time.Time{}
+			}
+		}
+	}
+	type chatItem struct {
+		jid string
+		at  time.Time
+	}
+	chats := make([]chatItem, 0, len(seen))
+	for jid, at := range seen {
+		chats = append(chats, chatItem{jid, at})
+	}
+	sort.Slice(chats, func(i, j int) bool {
+		if !chats[i].at.Equal(chats[j].at) {
+			return chats[i].at.After(chats[j].at)
+		}
+		return chats[i].jid < chats[j].jid
+	})
+	if len(chats) == 0 {
+		fmt.Println("No active chats found. Try running 'sync' to fetch from WhatsApp.")
+		return
+	}
+	for i, chat := range chats {
+		if i >= limit {
+			break
+		}
+		target, _ := client.FindContactTarget(ctx, chat.jid)
+		name := chat.jid
+		if target != nil && target.DisplayName != "" {
+			name = fmt.Sprintf("%s (%s)", target.DisplayName, chat.jid)
+		}
+		timeStr := "no messages"
+		if !chat.at.IsZero() {
+			timeStr = chat.at.Format("2006-01-02 15:04")
+		}
+		fmt.Printf("%d. %s\t[%s]\n", i+1, name, timeStr)
+	}
+}
+
+func chatsCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "chats [count]",
+		Short: "Show recent active chats",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			limit := 15
+			if len(args) > 0 {
+				if parsed, err := strconv.Atoi(args[0]); err == nil && parsed > 0 {
+					limit = parsed
+				}
+			}
+			return withClient(cmd, false, func(ctx context.Context, client *whatsapp.Client) error {
+				printChatsList(ctx, client, limit)
+				return nil
+			})
+		},
+	}
 }
 
 func inspectCommand() *cobra.Command {
@@ -248,7 +448,7 @@ func inspectCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+				_ = client.RequestRecentHistory(ctx, target.PrimaryJID, max(count, 50))
 				printRecentMessages(client, target, count)
 				return nil
 			})
@@ -632,6 +832,9 @@ func createInteractiveCompleter(_ *whatsapp.Client) *readline.PrefixCompleter {
 			readline.PcItem("<contact> [count]"),
 		),
 		readline.PcItem("chats"),
+		readline.PcItem("sync",
+			readline.PcItem("<contact>"),
+		),
 		readline.PcItem("status"),
 		readline.PcItem("setup"),
 		readline.PcItem("daemon"),
@@ -732,36 +935,22 @@ func runInteractiveShell(ctx context.Context, client *whatsapp.Client) error {
 				fmt.Printf("Inspect failed: %v\n", err)
 				break
 			}
-			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+			_ = client.RequestRecentHistory(ctx, target.PrimaryJID, max(count, 50))
 			printRecentMessages(client, target, count)
+		case "sync":
+			targetName := ""
+			if len(parts) > 1 {
+				targetName = strings.Join(parts[1:], " ")
+			}
+			startInteractiveSync(ctx, client, rl, targetName)
 		case "chats":
-			seen := map[string]time.Time{}
-			for _, message := range client.Messages() {
-				chatKey := message.Chat.ToNonAD().String()
-				if message.At.After(seen[chatKey]) {
-					seen[chatKey] = message.At
+			limit := 15
+			if len(parts) > 1 {
+				if parsedLimit, err := strconv.Atoi(parts[1]); err == nil && parsedLimit > 0 {
+					limit = parsedLimit
 				}
 			}
-			type chatItem struct {
-				jid string
-				at  time.Time
-			}
-			chats := make([]chatItem, 0, len(seen))
-			for jid, at := range seen {
-				chats = append(chats, chatItem{jid, at})
-			}
-			sort.Slice(chats, func(i, j int) bool { return chats[i].at.After(chats[j].at) })
-			for i, ch := range chats {
-				if i == 10 {
-					break
-				}
-				target, _ := client.FindContactTarget(ctx, ch.jid)
-				name := ch.jid
-				if target != nil && target.DisplayName != "" {
-					name = fmt.Sprintf("%s (%s)", target.DisplayName, ch.jid)
-				}
-				fmt.Printf("%d. %s\t[%s]\n", i+1, name, ch.at.Format("2006-01-02 15:04"))
-			}
+			printChatsList(ctx, client, limit)
 		case "daemon":
 			fmt.Println("Note: The scheduler daemon is already active inside this interactive session.")
 			fmt.Println("To run it in the background when the terminal is closed, run 'pstw daemon' from your system shell.")
@@ -864,36 +1053,22 @@ func runFallbackInteractiveShell(ctx context.Context, client *whatsapp.Client) e
 				fmt.Printf("Inspect failed: %v\n", err)
 				break
 			}
-			_ = client.RequestHistory(ctx, target.PrimaryJID, max(count, 50))
+			_ = client.RequestRecentHistory(ctx, target.PrimaryJID, max(count, 50))
 			printRecentMessages(client, target, count)
+		case "sync":
+			targetName := ""
+			if len(parts) > 1 {
+				targetName = strings.Join(parts[1:], " ")
+			}
+			startFallbackSync(ctx, client, targetName)
 		case "chats":
-			seen := map[string]time.Time{}
-			for _, message := range client.Messages() {
-				chatKey := message.Chat.ToNonAD().String()
-				if message.At.After(seen[chatKey]) {
-					seen[chatKey] = message.At
+			limit := 15
+			if len(parts) > 1 {
+				if parsedLimit, err := strconv.Atoi(parts[1]); err == nil && parsedLimit > 0 {
+					limit = parsedLimit
 				}
 			}
-			type chatItem struct {
-				jid string
-				at  time.Time
-			}
-			chats := make([]chatItem, 0, len(seen))
-			for jid, at := range seen {
-				chats = append(chats, chatItem{jid, at})
-			}
-			sort.Slice(chats, func(i, j int) bool { return chats[i].at.After(chats[j].at) })
-			for i, ch := range chats {
-				if i == 10 {
-					break
-				}
-				target, _ := client.FindContactTarget(ctx, ch.jid)
-				name := ch.jid
-				if target != nil && target.DisplayName != "" {
-					name = fmt.Sprintf("%s (%s)", target.DisplayName, ch.jid)
-				}
-				fmt.Printf("%d. %s\t[%s]\n", i+1, name, ch.at.Format("2006-01-02 15:04"))
-			}
+			printChatsList(ctx, client, limit)
 		case "daemon":
 			fmt.Println("Note: The scheduler daemon is already active inside this interactive session.")
 			fmt.Println("To run it in the background when the terminal is closed, run 'pstw daemon' from your system shell.")
@@ -1045,7 +1220,8 @@ func printHelp() {
 	fmt.Println("  schedules List scheduled messages")
 	fmt.Println("  cancel    Cancel a scheduled message: cancel <schedule-id>")
 	fmt.Println("  inspect   Show recent messages: inspect <contact> [count]")
-	fmt.Println("  chats     Show recent active chats")
+	fmt.Println("  chats     Show recent active chats: chats [count]")
+	fmt.Println("  sync      Sync latest messages, chats & contacts: sync [contact]")
 	fmt.Println("  status    Show the connected WhatsApp account")
 	fmt.Println("  setup     Show pairing status")
 	fmt.Println("  quit      Disconnect and exit WhatsDown")
@@ -1056,7 +1232,26 @@ func printStatus(client *whatsapp.Client) {
 		fmt.Println("Status: connected, account not available")
 		return
 	}
-	fmt.Printf("Status: connected\nAccount: %s\n", client.WhatsApp().Store.ID.String())
+	fmt.Printf("Status:   connected\nAccount:  %s\n", client.WhatsApp().Store.ID.String())
+	status := client.SyncStatus()
+	if status.IsRunning {
+		elapsed := time.Since(status.StartTime).Truncate(100 * time.Millisecond)
+		if status.Progress.StageName != "" {
+			if status.Progress.Total > 0 {
+				percent := float64(status.Progress.Current) / float64(status.Progress.Total) * 100
+				fmt.Printf("Sync:     🔄 In progress ([%d/%d] %s: %.0f%% (%d/%d) • %s, elapsed %s)\n",
+					status.Progress.StageIndex, status.Progress.StageTotal, status.Progress.StageName,
+					percent, status.Progress.Current, status.Progress.Total, status.Progress.Description, elapsed)
+			} else {
+				fmt.Printf("Sync:     🔄 In progress ([%d/%d] %s: %s, elapsed %s)\n",
+					status.Progress.StageIndex, status.Progress.StageTotal, status.Progress.StageName, status.Progress.Description, elapsed)
+			}
+		} else {
+			fmt.Printf("Sync:     🔄 In progress (elapsed %s)\n", elapsed)
+		}
+	} else if !status.LastSync.IsZero() {
+		fmt.Printf("Sync:     Idle (last synced %s, updated %d chats)\n", status.LastSync.Format("15:04:05"), status.SyncedCount)
+	}
 }
 
 func splitRecipientMessage(ctx context.Context, client *whatsapp.Client, args []string) (string, string, error) {

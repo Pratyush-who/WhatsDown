@@ -69,6 +69,35 @@ func (client *Client) MessagesForTarget(target *ContactTarget) []Message {
 	return matched
 }
 
+const SyncHistoryDays = 7
+
+func (client *Client) RequestRecentHistory(ctx context.Context, jid types.JID, count int) error {
+	jidNonAD := jid.ToNonAD()
+	if count <= 0 {
+		count = 25
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat: jidNonAD,
+		},
+		Timestamp: time.Now(),
+	}
+	request := client.device.BuildHistorySyncRequest(info, count)
+	if _, err := client.device.SendPeerMessage(ctx, request); err != nil {
+		return fmt.Errorf("request recent chat history: %w", err)
+	}
+	timer := time.NewTimer(1500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-client.historyDone:
+		return nil
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (client *Client) RequestHistory(ctx context.Context, jid types.JID, count int) error {
 	messages := client.Messages()
 	var oldest *Message
@@ -81,14 +110,14 @@ func (client *Client) RequestHistory(ctx context.Context, jid types.JID, count i
 		}
 	}
 	if oldest == nil {
-		return nil
+		return client.RequestRecentHistory(ctx, jid, count)
 	}
 	info := &types.MessageInfo{MessageSource: types.MessageSource{Chat: jid, IsFromMe: oldest.FromMe, Sender: oldest.Sender}, ID: types.MessageID(oldest.ID), Timestamp: oldest.At}
 	request := client.device.BuildHistorySyncRequest(info, count)
 	if _, err := client.device.SendPeerMessage(ctx, request); err != nil {
 		return fmt.Errorf("request chat history: %w", err)
 	}
-	timer := time.NewTimer(3 * time.Second)
+	timer := time.NewTimer(1500 * time.Millisecond)
 	defer timer.Stop()
 	select {
 	case <-client.historyDone:
@@ -101,16 +130,37 @@ func (client *Client) RequestHistory(ctx context.Context, jid types.JID, count i
 }
 
 func (client *Client) recordHistorySync(history *waHistorySync.HistorySync) {
+	cutoff := time.Now().AddDate(0, 0, -SyncHistoryDays)
+
+	for _, pushname := range history.GetPushnames() {
+		if pushname.GetID() != "" && pushname.GetPushname() != "" {
+			if jid, err := types.ParseJID(pushname.GetID()); err == nil {
+				_, _, _ = client.device.Store.Contacts.PutPushName(context.Background(), jid, pushname.GetPushname())
+			}
+		}
+	}
 	for _, conversation := range history.GetConversations() {
 		chat, err := types.ParseJID(conversation.GetID())
 		if err != nil || chat.IsEmpty() {
 			continue
+		}
+		if conversation.GetName() != "" || conversation.GetDisplayName() != "" {
+			name := conversation.GetName()
+			if name == "" {
+				name = conversation.GetDisplayName()
+			}
+			_ = client.device.Store.Contacts.PutContactName(context.Background(), chat, name, name)
 		}
 		for _, historical := range conversation.GetMessages() {
 			info := historical.GetMessage()
 			if info == nil || info.GetKey() == nil || info.GetMessage() == nil {
 				continue
 			}
+			ts := time.Unix(int64(info.GetMessageTimestamp()), 0)
+			if ts.Before(cutoff) {
+				continue // Don't sync or store messages before the cutoff date
+			}
+
 			key := info.GetKey()
 			sender := chat
 			if key.GetParticipant() != "" {
@@ -122,7 +172,6 @@ func (client *Client) recordHistorySync(history *waHistorySync.HistorySync) {
 			if text == "" {
 				continue
 			}
-			ts := time.Unix(int64(info.GetMessageTimestamp()), 0)
 			client.recordInMemory(Message{
 				ID:     key.GetID(),
 				Chat:   chat,

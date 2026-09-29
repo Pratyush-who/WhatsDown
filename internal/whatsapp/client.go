@@ -34,6 +34,14 @@ type Client struct {
 	historyDone     chan struct{}
 	schedules       *ScheduleStore
 	schedulerCancel context.CancelFunc
+
+	syncRunning    bool
+	syncStartTime  time.Time
+	syncProgress   SyncProgress
+	lastSyncTime   time.Time
+	lastSyncError  error
+	lastSyncCount  int
+	lastSyncTarget string
 }
 
 func New(ctx context.Context, dataDir string) (*Client, error) {
